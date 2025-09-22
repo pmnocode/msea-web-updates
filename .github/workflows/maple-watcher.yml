@@ -1,0 +1,24 @@
+name: MapleSEA Updates Watcher
+on:
+  schedule:
+    - cron: "*/15 * * * *"  # every 15 minutes
+  workflow_dispatch:
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests beautifulsoup4
+      - name: Restore DB (cache)
+        uses: actions/cache@v4
+        with:
+          path: seen_links.db
+          key: maple-db
+      - name: Create config.json from secret
+        run: |
+          echo '{ "DISCORD_WEBHOOK_URL": "'"${{ secrets.DISCORD_WEBHOOK_URL }}"'" }' > config.json
+      - run: python maplesea_updates_watcher.py
