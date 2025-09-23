@@ -12,13 +12,32 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install requests beautifulsoup4
-      - name: Restore DB (cache)
+
+      # ✅ Restore the most recent DB snapshot (if any)
+      - name: Restore DB (rolling cache)
         uses: actions/cache@v4
         with:
           path: seen_links.db
-          key: maple-db
+          # unique key each run => ensures the cache is saved after this run
+          key: maple-db-${{ github.run_id }}
+          # try to restore the newest prior cache with this prefix
+          restore-keys: |
+            maple-db-
+
+      - run: pip install requests beautifulsoup4
+
       - name: Create config.json from secret
         run: |
           echo '{ "DISCORD_WEBHOOK_URL": "'"${{ secrets.DISCORD_WEBHOOK_URL }}"'" }' > config.json
-      - run: python maplesea_updates_watcher.py
+
+      - name: Run watcher
+        run: python maplesea_updates_watcher.py
+
+      # (Optional) Downloadable snapshot to verify what the DB contains
+      # - name: Upload DB (artifact)
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: seen-links-db
+      #     path: seen_links.db
+      #     if-no-files-found: ignore
