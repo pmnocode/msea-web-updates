@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
 MapleSEA Updates Watcher
-- Checks https://www.maplesea.com/updates for new update links
-- Notifies a Discord channel via webhook when new links appear
-- Also detects if an existing link's headline (title) on the listing page changes
-- Stores "seen" links & last known title in a tiny SQLite database
+- Checks https://www.maplesea.com/updates for new links
+- Posts to one or many Discord webhooks
+- Supports per-webhook prefixes (e.g., <@USER_ID>, @everyone)
+- Detects title changes on the listing page as "updates"
+- Persists seen URLs and last known title in SQLite
 
-Setup:
-1) Put your Discord webhook URL into config.json (same folder as this script), e.g.:
-   { "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/XXXX" }
-2) Run once manually; then your GitHub Actions schedule will handle the rest.
+Config priority:
+1) config.json written by the workflow from GitHub Secrets:
+   { "DISCORD_WEBHOOK_URLS": [ {"url":"...","prefix":"..."}, ... ] }
+2) Fallback env vars for quick local testing:
+   - DISCORD_WEBHOOK_URL            (single URL)
+   - DISCORD_WEBHOOK_URLS_CSV       (comma-separated URLs)
 """
 
 import os, sqlite3, re, json
@@ -24,9 +27,11 @@ DB_PATH = os.environ.get("DB_PATH", "seen_links.db")
 CONFIG_PATH = "config.json"
 
 HEADERS = {
-    "User-Agent": "MapleSEA-Updates-Watcher/1.1 (contact: example@example.com)"
+    "User-Agent": "MapleSEA-Updates-Watcher/1.2 (+https://github.com/your/repo)"
 }
 TIMEOUT = 20
+
+# ---------- Config loading ----------
 
 def load_config():
     cfg = {}
@@ -36,11 +41,23 @@ def load_config():
                 cfg = json.load(f)
         except Exception as e:
             print(f"WARNING: Could not read {CONFIG_PATH}: {e}")
-    if not cfg.get("DISCORD_WEBHOOK_URL"):
-        env_url = os.environ.get("DISCORD_WEBHOOK_URL")
-        if env_url:
-            cfg["DISCORD_WEBHOOK_URL"] = env_url
+
+    webhooks = cfg.get("DISCORD_WEBHOOK_URLS")
+
+    # Backward-compatible fallbacks for local/manual runs
+    if not webhooks:
+        single = os.environ.get("DISCORD_WEBHOOK_URL")
+        if single:
+            webhooks = [{"url": single, "prefix": ""}]
+    if not webhooks:
+        csv = os.environ.get("DISCORD_WEBHOOK_URLS_CSV")
+        if csv:
+            webhooks = [{"url": u.strip(), "prefix": ""} for u in csv.split(",") if u.strip()]
+
+    cfg["DISCORD_WEBHOOK_URLS"] = webhooks or []
     return cfg
+
+# ---------- DB helpers ----------
 
 def init_db():
     """Create table if missing; add new columns if coming from older script."""
@@ -53,7 +70,6 @@ def init_db():
             last_changed_utc TEXT
         )
     """)
-    # Safe no-ops if columns already exist:
     for coldef in ("last_title TEXT", "last_changed_utc TEXT"):
         try:
             conn.execute(f"ALTER TABLE seen_links ADD COLUMN {coldef}")
@@ -88,6 +104,8 @@ def mark_seen(conn, items):
     """, [(u, now, t, None) for (u, t) in items])
     conn.commit()
 
+# ---------- Scrape + notify ----------
+
 def fetch_links():
     r = requests.get(BASE_URL, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
@@ -111,52 +129,68 @@ def fetch_links():
             uniq.append((url, text))
     return uniq
 
-def send_discord(webhook_url, url, title_or_message):
-    if not webhook_url:
-        print("⚠️  DISCORD_WEBHOOK_URL not set. Please fill config.json.")
-        print(f"[MSG] {title_or_message}\n{url}")
-        return
-    payload = {"content": f"{title_or_message}\n{url}"}
+def send_to_webhook(webhook_url, message, url):
+    payload = {"content": f"{message}\n{url}"}
     try:
         resp = requests.post(webhook_url, json=payload, timeout=TIMEOUT)
         resp.raise_for_status()
     except Exception as e:
-        print(f"ERROR sending to Discord: {e}")
+        print(f"ERROR sending to Discord ({webhook_url[:60]}...): {e}")
+
+def send_discord(webhooks, message, url):
+    """
+    webhooks: list of {"url": str, "prefix": str}
+    """
+    if not webhooks:
+        print("⚠️  No Discord webhooks configured. Printing message instead:")
+        print(f"{message}\n{url}")
+        return
+    for w in webhooks:
+        if isinstance(w, dict):
+            prefix = w.get("prefix", "")
+            u = w.get("url")
+            if u:
+                send_to_webhook(u, f"{prefix}{message}", url)
+        elif isinstance(w, str):
+            # tolerate plain string entries
+            send_to_webhook(w, message, url)
+
+# ---------- Main ----------
 
 def main():
     cfg = load_config()
-    webhook = cfg.get("DISCORD_WEBHOOK_URL")
+    webhooks = cfg.get("DISCORD_WEBHOOK_URLS", [])
 
     conn = init_db()
     previously_seen = get_seen(conn)
 
     try:
-        items = fetch_links()  # list[(url, title)] newest-first on MapleSEA
+        items = fetch_links()  # list[(url, title)]
     except Exception as e:
         print(f"ERROR fetching {BASE_URL}: {e}")
         return 1
 
-    # 1) Handle brand-new URLs
+    # 1) New URLs
     new_items = [(u, t) for (u, t) in items if u not in previously_seen]
     if new_items:
         for url, title in new_items:
-            send_discord(webhook, url, f"🆕 NEW: **{title}**")
+            send_discord(webhooks, f"🆕 NEW: **{title}**", url)
         mark_seen(conn, new_items)
 
-    # 2) Handle UPDATED titles on the listing page
+    # 2) Title updates on listing page
     updated_count = 0
     for url, title in items:
         if url not in previously_seen:
-            continue  # just handled above
+            continue
         row = get_row(conn, url)
         if not row:
             continue
         last_title = row["last_title"]
         if not last_title:
-            # Backfill without notifying (first time migrating old DB rows)
+            # Backfill title (DB from earlier version)
             set_title(conn, url, title)
         elif title != last_title:
-            send_discord(webhook, url, f"🔄 UPDATED (title changed): **{title}**")
+            send_discord(webhooks, f"🔄 UPDATED (title changed): **{title}**", url)
             set_title(conn, url, title)
             updated_count += 1
 
