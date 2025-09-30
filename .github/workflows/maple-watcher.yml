@@ -28,7 +28,7 @@ jobs:
 
       - name: Create config.json from secret
         run: |
-          echo '{ "DISCORD_WEBHOOK_URL": "'"${{ secrets.DISCORD_WEBHOOK_URL }}"'" }' > config.json
+          echo "{\"DISCORD_WEBHOOK_URLS\": ${{ secrets.DISCORD_WEBHOOK_URLS_JSON }}}" > config.json
 
       - name: Run watcher
         run: python maplesea_updates_watcher.py
